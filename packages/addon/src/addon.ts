@@ -3,12 +3,15 @@ import addonBuilder from 'stremio-addon-sdk/src/builder';
 import { manifest } from './manifest';
 import {
   buildSearchQuery,
+  calculateBitrate,
   createStreamPath,
   createStreamUrl,
   getDuration,
   getFileExtension,
   getPostTitle,
-  getQuality,
+  getRecommendedInternetSpeed,
+  getAudioQuality,
+  getVideoQuality,
   getSize,
   isBadVideo,
   logError,
@@ -16,12 +19,18 @@ import {
   getAlternativeTitles,
   isAuthError,
 } from './utils';
-import { EasynewsAPI, SearchOptions, EasynewsSearchResponse } from 'easynews-plus-plus-api';
+import {
+  EasynewsAPI,
+  SearchOptions,
+  EasynewsSearchResponse,
+  FileData,
+} from 'easynews-plus-plus-api';
 import { publicMetaProvider } from './meta';
-import { Stream } from './types';
+import { Stream, VideoQuality } from './types';
 import customTitlesJson from '../../../custom-titles.json';
 import { getUILanguage, translations } from './i18n';
 import { createLogger } from 'easynews-plus-plus-shared';
+import { filenameParse } from '@ctrl/video-filename-parser';
 
 // Extended configuration interface
 interface AddonConfig {
@@ -36,6 +45,11 @@ interface AddonConfig {
   baseUrl?: string; // Scheme, host and (optional port)
   [key: string]: any;
 }
+
+type SearchResult = {
+  query: string;
+  result: EasynewsSearchResponse;
+};
 
 // Create a logger with Addon prefix and explicitly set the level from environment variable
 export const logger = createLogger({
@@ -65,10 +79,150 @@ const DEFAULT_CONFIG = {
   strictTitleMatching: 'true',
   preferredLanguage: '',
   sortingPreference: 'quality_first',
-  showQualities: '4k,1080p,720p,480p',
+  showQualities: '2160p,1080p,720p,480p',
   maxResultsPerQuality: '0',
   maxFileSize: '0',
 };
+
+function parseConfig(config: AddonConfig): {
+  useStrictMatching: boolean;
+  preferredLang: string;
+  qualityFilters: string[];
+  maxResultsPerQuality: number;
+  maxFileSizeGB: number;
+  sortOptions: Partial<SearchOptions>;
+} {
+  // Apply default values for any missing configuration options
+  const {
+    username,
+    password,
+    strictTitleMatching = DEFAULT_CONFIG.strictTitleMatching,
+    preferredLanguage = DEFAULT_CONFIG.preferredLanguage,
+    sortingPreference = DEFAULT_CONFIG.sortingPreference,
+    showQualities = DEFAULT_CONFIG.showQualities,
+    maxResultsPerQuality = DEFAULT_CONFIG.maxResultsPerQuality,
+    maxFileSize = DEFAULT_CONFIG.maxFileSize,
+    baseUrl,
+    ...options
+  } = config;
+
+  /**
+   * Parse strictTitleMatching option (checkbox returns string 'on' or undefined)
+   * and convert it to a boolean value.
+   */
+  const useStrictMatching =
+    config.strictTitleMatching === 'on' || config.trictTitleMatching === 'true';
+  if (!config.strictTitleMatching) {
+    logger.info(`Using default strictTitleMatching: ${strictTitleMatching}`);
+  } else {
+    logger.info(`Strict title matching: ${useStrictMatching ? 'enabled' : 'disabled'}`);
+  }
+
+  /**
+   * Parse preferredLanguage option from the config.
+   * If the option is not set, use the default value.
+   */
+  const preferredLang = config.preferredLanguage || '';
+  if (!config.preferredLanguage) {
+    logger.info(`Using default preferredLanguage: ${config.preferredLanguage || 'No preference'}`);
+  } else {
+    /**
+     * Get preferred language from configuration.
+     * If the option is not set, do not log anything.
+     */
+    logger.info(
+      `Preferred language: ${config.preferredLanguage ? config.preferredLanguage : 'No preference'}`
+    );
+  }
+
+  /**
+   * Parse quality filters from the configuration.
+   * If the option is not set, use the default value.
+   */
+  const qualityFilters = config.showQualities
+    ? config.showQualities
+        .split(',')
+        .map(q => q.trim().toLowerCase())
+        .filter(Boolean)
+    : ['2160p', '1080p', '720p', '480p'];
+
+  if (!config.showQualities) {
+    logger.info('Using default showQualities: ' + config.showQualities);
+  } else {
+    logger.info(`Quality filters: ${qualityFilters.join(', ')}`);
+  }
+
+  /**
+   * Parse max results per quality from the configuration.
+   * If the option is not set, use the default value (0 = no limit).
+   * If the value is not a number, use the default value.
+   */
+  let maxResultsPerQualityValue = parseInt(config.maxResultsPerQuality ?? '0', 10);
+  if (Number.isNaN(maxResultsPerQualityValue) || maxResultsPerQualityValue < 0) {
+    maxResultsPerQualityValue = 0;
+  }
+  if (!config.maxResultsPerQuality) {
+    logger.info('Using default maxResultsPerQuality: ' + config.maxResultsPerQuality);
+  } else {
+    logger.info(
+      `Max results per quality: ${maxResultsPerQualityValue === 0 ? 'No limit' : maxResultsPerQualityValue}`
+    );
+  }
+
+  /**
+   * Parse max file size from the configuration.
+   * If the option is not set or is invalid, use the default value (0 = no limit).
+   */
+  let maxFileSizeGB = parseFloat(config.maxFileSize ?? '0');
+  if (Number.isNaN(maxFileSizeGB) || maxFileSizeGB < 0) {
+    maxFileSizeGB = 0; // Default to no limit if invalid
+  }
+
+  // Log the max file size setting
+  if (!config.maxFileSize) {
+    logger.info('Using default maxFileSize: ' + config.maxFileSize);
+  } else {
+    logger.info(`Max file size: ${maxFileSizeGB === 0 ? 'No limit' : maxFileSizeGB + ' GB'}`);
+  }
+
+  if (!config.sortingPreference) {
+    logger.info(`Using default sortingPreference: ${config.sortingPreference}`);
+  } else {
+    logger.info(`Sorting preference from config: ${config.sortingPreference}`);
+  }
+
+  // Configure API sorting options based on user sorting preference
+  const sortOptions: Partial<SearchOptions> = {
+    query: '', // Will be set for each search later
+  };
+
+  // Set consistent API sorting parameters regardless of user sorting preference
+  // This ensures we always get the same raw results
+  // We'll handle user sorting preferences after fetching all results
+
+  // Use parameters that give us the most complete results
+  sortOptions.sort1 = 'relevance'; // Use relevance as primary sort
+  sortOptions.sort1Direction = '-'; // Descending
+  sortOptions.sort2 = 'dsize'; // Then size
+  sortOptions.sort2Direction = '-'; // Descending
+  // Set a consistent third sort option
+  sortOptions.sort3 = 'dtime'; // DateTime
+  sortOptions.sort3Direction = '-'; // Descending
+
+  // Log the API sorting parameters
+  logger.debug(
+    `API Sorting: ${sortOptions.sort1} (${sortOptions.sort1Direction}), ${sortOptions.sort2} (${sortOptions.sort2Direction}), ${sortOptions.sort3} (${sortOptions.sort3Direction})`
+  );
+
+  return {
+    useStrictMatching,
+    preferredLang,
+    qualityFilters,
+    maxResultsPerQuality: maxResultsPerQualityValue,
+    maxFileSizeGB,
+    sortOptions,
+  };
+}
 
 const builder = new addonBuilder(manifest);
 
@@ -91,6 +245,148 @@ function getFromCache<T>(key: string): T | null {
 
 function setCache<T>(key: string, data: T): void {
   requestCache.set(key, { data, timestamp: Date.now() });
+}
+
+/**
+ * Helper function to count the total number of unique results
+ * across all searches. This is used to detect when we've reached
+ * the global limit of results.
+ *
+ * @param allSearchResults The array of search results
+ * @returns The total number of unique results
+ */
+function countTotalUniqueResults(allSearchResults: SearchResult[]): number {
+  const uniqueHashes = new Set<string>();
+
+  for (const { result } of allSearchResults) {
+    for (const file of result.data ?? []) {
+      const fileHash = file['0'];
+      uniqueHashes.add(fileHash);
+    }
+  }
+
+  return uniqueHashes.size;
+}
+
+// Get quality scores with improved 4K detection
+const getQualityScore = (quality: VideoQuality): number => {
+  if (!quality) return 0;
+
+  if (quality === VideoQuality.UHD_4K) return 4;
+  if (quality === VideoQuality.FULLHD) return 3;
+  if (quality === VideoQuality.HD) return 2;
+  if (quality === VideoQuality.SD) return 1;
+  return 0;
+};
+
+const getResolution = (file: FileData): VideoQuality => {
+  const width = file.xres;
+  const height = file.yres;
+  const totalPixels = width * height;
+  const maxDimension = Math.max(width, height);
+
+  if (maxDimension >= 3800 || totalPixels >= 7000000) {
+    return VideoQuality.UHD_4K;
+  }
+  if (maxDimension >= 1900 || (maxDimension >= 1800 && totalPixels >= 1400000)) {
+    return VideoQuality.FULLHD;
+  }
+  if (maxDimension >= 1200 || (maxDimension >= 1100 && totalPixels >= 700000)) {
+    return VideoQuality.HD;
+  }
+  return VideoQuality.SD;
+};
+
+const compareSize = (aFile: FileData, bFile: FileData) => {
+  if (aFile.rawSize > bFile.rawSize) {
+    return -1;
+  }
+  if (aFile.rawSize < bFile.rawSize) {
+    return 1;
+  }
+  return 0;
+};
+
+const sortByQualityAndSize = (a: Stream, b: Stream) => {
+  const aFile = (a as any)._temp?.file as FileData;
+  const bFile = (b as any)._temp?.file as FileData;
+
+  const aResolution = getResolution(aFile);
+  const bResolution = getResolution(bFile);
+
+  // Extract quality scores
+  const aScore = getQualityScore(aResolution);
+  const bScore = getQualityScore(bResolution);
+
+  // Compare quality scores
+  if (aScore !== bScore) {
+    return bScore - aScore;
+  }
+
+  // Compare sizes
+  return compareSize(aFile, bFile);
+};
+
+async function searchWithTitleVariant(
+  titleVariant: string,
+  meta: any,
+  year: number | undefined,
+  type: ContentType,
+  api: EasynewsAPI,
+  sortOptions: Partial<SearchOptions>,
+  allSearchResults: SearchResult[],
+  totalFoundResults: number,
+  TOTAL_MAX_RESULTS: number
+): Promise<{ allSearchResults: SearchResult[]; totalFoundResults: number }> {
+  // Skip empty titles
+  if (!titleVariant.trim()) return { allSearchResults, totalFoundResults };
+
+  // Stop searching if we already have enough results
+  if (totalFoundResults >= TOTAL_MAX_RESULTS) {
+    logger.debug(
+      `Already found ${totalFoundResults} unique results, skipping additional title searches`
+    );
+    return { allSearchResults, totalFoundResults };
+  }
+
+  const titleMeta = { ...meta, name: titleVariant, year: year };
+  const query = buildSearchQuery(type, titleMeta);
+  logger.debug(`Searching for: "${query}"`);
+
+  try {
+    const res = await api.search({
+      ...sortOptions,
+      query,
+    });
+
+    const resultCount = res?.data?.length || 0;
+    logger.debug(`Found ${resultCount} results for "${query}" with year`);
+
+    if (resultCount > 0) {
+      allSearchResults.push({ query, result: res });
+      totalFoundResults = countTotalUniqueResults(allSearchResults);
+      logger.debug(`Total unique results so far: ${totalFoundResults}`);
+
+      // Log a few examples of the results
+      const examples = res.data.slice(0, 2);
+      for (const file of examples) {
+        const title = getPostTitle(file);
+        logger.debug(`Example result: "${title}" (${file['4'] || 'unknown size'})`);
+      }
+    }
+  } catch (error) {
+    logger.error(`Error searching for "${query}":`, error);
+
+    // Check if it's an authentication error
+    if (isAuthError(error)) {
+      // Throw an exception
+      throw error;
+    }
+
+    // Continue with other titles even if one fails
+  }
+
+  return { allSearchResults, totalFoundResults };
 }
 
 // Load custom titles
@@ -132,163 +428,58 @@ export const landingHTML = customTemplate(manifest);
 
 builder.defineStreamHandler(
   async ({ id, type, config }: { id: string; type: ContentType; config: AddonConfig }) => {
-    // Apply default values for any missing configuration options
     const {
-      username,
-      password,
-      strictTitleMatching = DEFAULT_CONFIG.strictTitleMatching,
-      preferredLanguage = DEFAULT_CONFIG.preferredLanguage,
-      sortingPreference = DEFAULT_CONFIG.sortingPreference,
-      showQualities = DEFAULT_CONFIG.showQualities,
-      maxResultsPerQuality = DEFAULT_CONFIG.maxResultsPerQuality,
-      maxFileSize = DEFAULT_CONFIG.maxFileSize,
-      baseUrl,
-      ...options
-    } = config;
+      useStrictMatching,
+      preferredLang,
+      qualityFilters,
+      maxResultsPerQuality: maxResultsPerQualityValue,
+      maxFileSizeGB,
+      sortOptions,
+    } = parseConfig(config);
 
+    // If the id doesn't start with tt, return empty streams
+    // This is a workaround to prevent the addon from trying to
+    // fetch streams for non-IMDb IDs, which the API doesn't support
     if (!id.startsWith('tt')) {
       return {
         streams: [],
       };
     }
 
-    // Include settings in cache key to ensure
-    // users with different settings get different cache results
-    const cacheKey = `${id}:v3:user=${username}:strict=${strictTitleMatching === 'on' || strictTitleMatching === 'true'}:lang=${preferredLanguage || ''}:sort=${sortingPreference}:qualities=${showQualities || ''}:maxPerQuality=${maxResultsPerQuality || ''}:maxSize=${maxFileSize || ''}`;
+    /**
+     * Cache key is a string that includes all the user settings that might affect
+     * the results of the API call. This ensures that users with different settings
+     * get different cache results.
+     *
+     * The cache key format is:
+     * <id>:v3:user=<username>:strict=<true|false>:lang=<language>:sort=<sorting preference>:qualities=<comma separated list of qualities>:maxPerQuality=<max results per quality>:maxSize=<max file size>
+     */
+    const cacheKey = `${id}:v3:user=${config.username}:strict=${config.strictTitleMatching === 'on' || config.strictTitleMatching === 'true'}:lang=${config.preferredLanguage || ''}:sort=${config.sortingPreference}:qualities=${config.showQualities || ''}:maxPerQuality=${config.maxResultsPerQuality || ''}:maxSize=${config.maxFileSize || ''}`;
 
     logger.debug(`Cache key: ${cacheKey}`);
     const cached = getFromCache<{ streams: Stream[] }>(cacheKey);
 
+    /**
+     * If a cached result exists, return it. Otherwise, make the API call.
+     * This ensures that the API is only called when the user settings have changed.
+     */
     if (cached) {
       return cached;
     }
 
     try {
-      if (!username || !password) {
+      if (!config.username || !config.password) {
         // Instead of throwing error, return a single stream with error message
         return authErrorStream(config.preferredLanguage || '');
       }
 
-      const useStrictMatching = strictTitleMatching === 'on' || strictTitleMatching === 'true';
-      if (!config.strictTitleMatching) {
-        logger.info(`Using default strictTitleMatching: ${strictTitleMatching}`);
-      } else {
-        // Parse strictTitleMatching option (checkbox returns string 'on' or undefined)
-        logger.info(`Strict title matching: ${useStrictMatching ? 'enabled' : 'disabled'}`);
-      }
-
-      const preferredLang = preferredLanguage || '';
-      if (!config.preferredLanguage) {
-        logger.info(`Using default preferredLanguage: ${preferredLanguage || 'No preference'}`);
-      } else {
-        // Get preferred language from configuration
-        logger.info(
-          `Preferred language: ${preferredLanguage ? preferredLanguage : 'No preference'}`
-        );
-      }
-
-      // Parse quality filters
-      const qualityFilters = showQualities
-        ? showQualities
-            .split(',')
-            .map(q => q.trim().toLowerCase())
-            .filter(Boolean)
-        : ['4k', '1080p', '720p', '480p'];
-
-      if (!config.showQualities) {
-        logger.info('Using default showQualities: ' + showQualities);
-      } else {
-        logger.info(`Quality filters: ${qualityFilters.join(', ')}`);
-      }
-
-      // Parse max results per quality (0 = no limit)
-      let maxResultsPerQualityValue = parseInt(maxResultsPerQuality ?? '0', 10);
-      if (Number.isNaN(maxResultsPerQualityValue) || maxResultsPerQualityValue < 0) {
-        maxResultsPerQualityValue = 0;
-      }
-      if (!config.maxResultsPerQuality) {
-        logger.info('Using default maxResultsPerQuality: ' + maxResultsPerQuality);
-      } else {
-        logger.info(
-          `Max results per quality: ${maxResultsPerQualityValue === 0 ? 'No limit' : maxResultsPerQualityValue}`
-        );
-      }
-
-      // Parse max file size (0 = no limit)
-      let maxFileSizeGB = parseFloat(maxFileSize ?? '0');
-      if (Number.isNaN(maxFileSizeGB) || maxFileSizeGB < 0) {
-        maxFileSizeGB = 0;
-      }
-      if (!config.maxFileSize) {
-        logger.info('Using default maxFileSize: ' + maxFileSize);
-      } else {
-        logger.info(`Max file size: ${maxFileSizeGB === 0 ? 'No limit' : maxFileSizeGB + ' GB'}`);
-      }
-
-      // Use custom titles from custom-titles.json
-      const customTitles = { ...titlesFromFile };
-
-      logger.debug(
-        `Using ${Object.keys(customTitles).length} custom titles from custom-titles.json`
-      );
-
-      if (!config.sortingPreference) {
-        logger.info(`Using default sortingPreference: ${sortingPreference}`);
-      } else {
-        logger.info(`Sorting preference from config: ${sortingPreference}`);
-      }
-
-      // Configure API sorting options based on user sorting preference
-      const sortOptions: Partial<SearchOptions> = {
-        query: '', // Will be set for each search later
-      };
-
-      // Set consistent API sorting parameters regardless of user sorting preference
-      // This ensures we always get the same raw results
-      // We'll handle user sorting preferences after fetching all results
-
-      // Use parameters that give us the most complete results
-      sortOptions.sort1 = 'relevance'; // Use relevance as primary sort
-      sortOptions.sort1Direction = '-'; // Descending
-      sortOptions.sort2 = 'dsize'; // Then size
-      sortOptions.sort2Direction = '-'; // Descending
-      // Set a consistent third sort option
-      sortOptions.sort3 = 'dtime'; // DateTime
-      sortOptions.sort3Direction = '-'; // Descending
-
-      // Log the API sorting parameters
-      logger.debug(
-        `API Sorting: ${sortOptions.sort1} (${sortOptions.sort1Direction}), ${sortOptions.sort2} (${sortOptions.sort2Direction}), ${sortOptions.sort3} (${sortOptions.sort3Direction})`
-      );
-
-      const meta = await publicMetaProvider(id, type, preferredLanguage);
+      const meta = await publicMetaProvider(id, type, config.preferredLanguage);
       logger.info(`Searching for: ${meta.name}`);
-
-      // Check if we have a custom title for this title directly
-      if (customTitles[meta.name]) {
-        logger.info(
-          `Direct custom title found for "${meta.name}": "${customTitles[meta.name].join('", "')}"`
-        );
-      } else {
-        logger.info(`No direct custom title found for "${meta.name}", checking partial matches`);
-
-        // Look for partial matches in title keys
-        for (const [key, values] of Object.entries(customTitles)) {
-          if (
-            meta.name.toLowerCase().includes(key.toLowerCase()) ||
-            key.toLowerCase().includes(meta.name.toLowerCase())
-          ) {
-            logger.debug(
-              `Possible title match: "${meta.name}" ~ "${key}" -> "${values.join('", "')}"`
-            );
-          }
-        }
-      }
 
       // Initialize the API with user credentials
       let api;
       try {
-        api = new EasynewsAPI({ username, password });
+        api = new EasynewsAPI({ username: config.username, password: config.password });
       } catch (error) {
         logger.error(`API initialization error: ${error}`);
         return authErrorStream(config.preferredLanguage || '');
@@ -298,14 +489,6 @@ builder.defineStreamHandler(
 
       // Initialize with the original title
       let allTitles = [meta.name];
-
-      // Add any direct custom titles found in customTitles
-      if (customTitles[meta.name] && customTitles[meta.name].length > 0) {
-        logger.debug(
-          `Adding direct custom titles for "${meta.name}": "${customTitles[meta.name].join('", "')}"`
-        );
-        allTitles = [...allTitles, ...customTitles[meta.name]];
-      }
 
       // Add any alternative names from meta (if available)
       if (meta.alternativeNames && meta.alternativeNames.length > 0) {
@@ -317,154 +500,80 @@ builder.defineStreamHandler(
         allTitles = [...allTitles, ...newAlternatives];
       }
 
-      // Use getAlternativeTitles to find additional matches (like partial matches)
-      const additionalTitles = getAlternativeTitles(meta.name, customTitles).filter(
-        alt => !allTitles.includes(alt) && alt !== meta.name
-      );
-
-      if (additionalTitles.length > 0) {
-        logger.debug(`Adding ${additionalTitles.length} additional titles from partial matches`);
-        allTitles = [...allTitles, ...additionalTitles];
-      }
-
       logger.debug(`Will search for ${allTitles.length} titles: ${allTitles.join(', ')}`);
 
       // Store all search results here
-      const allSearchResults: {
-        query: string;
-        result: EasynewsSearchResponse;
-      }[] = [];
+      let allSearchResults: SearchResult[] = [];
 
       // Early exit condition - limit API calls
       const TOTAL_MAX_RESULTS = parseInt(process.env.TOTAL_MAX_RESULTS || '500');
       let totalFoundResults = 0;
 
-      // Helper function to count total unique results across all searches
-      const countTotalUniqueResults = () => {
-        const uniqueHashes = new Set<string>();
-        for (const { result } of allSearchResults) {
-          for (const file of result.data ?? []) {
-            const fileHash = file['0'];
-            uniqueHashes.add(fileHash);
-          }
-        }
-        return uniqueHashes.size;
-      };
-
-      // First try without year for each title variant
-      for (const titleVariant of allTitles) {
-        // Skip empty titles
-        if (!titleVariant.trim()) continue;
-
-        // Stop searching if we already have enough results
-        if (totalFoundResults >= TOTAL_MAX_RESULTS) {
-          logger.debug(
-            `Already found ${totalFoundResults} unique results, skipping additional title searches`
-          );
-          break;
-        }
-
-        const titleMeta = { ...meta, name: titleVariant, year: undefined };
-        const query = buildSearchQuery(type, titleMeta);
-        logger.debug(`Searching without year for: "${query}"`);
-
-        try {
-          const res = await api.search({
-            ...sortOptions,
-            query,
-          });
-
-          const resultCount = res?.data?.length || 0;
-          logger.debug(`Found ${resultCount} results for "${query}" without year`);
-
-          if (resultCount > 0) {
-            allSearchResults.push({ query, result: res });
-            totalFoundResults = countTotalUniqueResults();
-            logger.debug(`Total unique results so far: ${totalFoundResults}`);
-
-            // Log a few examples of the results
-            const examples = res.data.slice(0, 2);
-            for (const file of examples) {
-              const title = getPostTitle(file);
-              logger.debug(`Example result: "${title}" (${file['4'] || 'unknown size'})`);
-            }
-          }
-        } catch (error) {
-          logger.error(`Error searching for "${query}":`, error);
-
-          // Check if it's an authentication error
-          if (isAuthError(error)) return authErrorStream(config.preferredLanguage || '');
-
-          // Continue with other titles even if one fails
-        }
-      }
+      console.time('Easynews API call');
 
       // If meta.year is defined, also search with year included (regardless of whether we found results without year)
       if (meta.year !== undefined) {
-        // Skip year search if we already have enough results
-        if (totalFoundResults >= TOTAL_MAX_RESULTS) {
-          logger.debug(
-            `Already found ${totalFoundResults} unique results, skipping year-based searches`
-          );
-        } else {
-          // If we already found results without year, log that we're still searching with year
-          if (allSearchResults.length > 0) {
-            logger.debug(
-              `Found ${totalFoundResults} unique results without year, also trying with year: ${meta.year}`
-            );
-          } else {
-            logger.debug(`No results found without year, trying with year: ${meta.year}`);
-          }
-
-          for (const titleVariant of allTitles) {
-            // Skip empty titles
-            if (!titleVariant.trim()) continue;
-
-            // Stop searching if we already have enough results
-            if (totalFoundResults >= TOTAL_MAX_RESULTS) {
-              logger.debug(
-                `Already found ${totalFoundResults} unique results, skipping additional title searches with year`
+        for (const titleVariant of allTitles) {
+          try {
+            const { allSearchResults: newResults, totalFoundResults: newTotal } =
+              await searchWithTitleVariant(
+                titleVariant,
+                meta,
+                meta.year,
+                type,
+                api,
+                sortOptions,
+                allSearchResults,
+                totalFoundResults,
+                TOTAL_MAX_RESULTS
               );
-              break;
+            allSearchResults = newResults;
+            totalFoundResults = newTotal;
+          } catch (error) {
+            if (isAuthError(error)) {
+              // Return an authentication error stream
+              return authErrorStream(config.preferredLanguage || '');
             }
-
-            const titleMeta = { ...meta, name: titleVariant, year: meta.year };
-            const query = buildSearchQuery(type, titleMeta);
-            logger.debug(`Searching with year for: "${query}"`);
-
-            try {
-              const res = await api.search({
-                ...sortOptions,
-                query,
-              });
-
-              const resultCount = res?.data?.length || 0;
-              logger.debug(`Found ${resultCount} results for "${query}" with year`);
-
-              if (resultCount > 0) {
-                allSearchResults.push({ query, result: res });
-                totalFoundResults = countTotalUniqueResults();
-                logger.debug(`Total unique results so far: ${totalFoundResults}`);
-
-                // Log a few examples of the results
-                const examples = res.data.slice(0, 2);
-                for (const file of examples) {
-                  const title = getPostTitle(file);
-                  logger.debug(`Example result: "${title}" (${file['4'] || 'unknown size'})`);
-                }
-              }
-            } catch (error) {
-              logger.error(`Error searching for "${query}":`, error);
-
-              // Check if it's an authentication error
-              if (isAuthError(error)) return authErrorStream(config.preferredLanguage || '');
-
-              // Continue with other titles even if one fails
-            }
+            // Handle other types of errors
           }
         }
       }
 
+      if (allSearchResults.length > 0 && totalFoundResults < TOTAL_MAX_RESULTS) {
+        logger.debug(
+          `Found ${totalFoundResults} unique results with year, also trying without year: ${meta.year}`
+        );
+      } else {
+        logger.debug(`No results found with year, trying without year.`);
+      }
+
+      // Now try without year for each title variant
+      for (const titleVariant of allTitles) {
+        try {
+          const { allSearchResults: newResults, totalFoundResults: newTotal } =
+            await searchWithTitleVariant(
+              titleVariant,
+              meta,
+              undefined, // No year
+              type,
+              api,
+              sortOptions,
+              allSearchResults,
+              totalFoundResults,
+              TOTAL_MAX_RESULTS
+            );
+          allSearchResults = newResults;
+          totalFoundResults = newTotal;
+        } catch (error) {
+          if (isAuthError(error)) {
+            // Return an authentication error stream
+            return authErrorStream(config.preferredLanguage || '');
+          }
+          // Handle other types of errors
+        }
+      }
+
+      console.timeEnd('Easynews API call');
       if (allSearchResults.length === 0) {
         return { streams: [] };
       }
@@ -477,6 +586,7 @@ builder.defineStreamHandler(
       // Apply global limit across all search results
       logger.debug(`Global stream limit: ${TOTAL_MAX_RESULTS} results across all searches`);
 
+      console.time('Processing search results');
       // Process each search result
       for (const { query, result: res } of allSearchResults) {
         // Skip adding more results if we've already reached the limit
@@ -494,7 +604,7 @@ builder.defineStreamHandler(
             break;
           }
 
-          const title = getPostTitle(file);
+          const postTitle = getPostTitle(file);
           const fileHash = file['0']; // Use file hash to detect duplicates
 
           if (isBadVideo(file) || processedHashes.has(fileHash)) {
@@ -527,8 +637,8 @@ builder.defineStreamHandler(
             }
 
             // Use strictTitleMatching setting if enabled for series
-            if (!queries.some(q => matchesTitle(title, q, useStrictMatching))) {
-              logger.debug(`Rejected series by title matching: "${title}"`);
+            if (!queries.some(q => matchesTitle(postTitle, q, useStrictMatching))) {
+              logger.debug(`Rejected series by title matching: "${postTitle}"`);
               continue;
             }
           }
@@ -541,29 +651,30 @@ builder.defineStreamHandler(
               name: titleVariant,
             });
             // For movies, only use strictTitleMatching if enabled by user, just like for series
-            return matchesTitle(title, variantQuery, useStrictMatching);
+            return matchesTitle(postTitle, variantQuery, useStrictMatching);
           });
 
           if (!matchesAnyVariant) {
-            logger.debug(`Rejected ${type} by title matching: "${title}"`);
+            logger.debug(`Rejected ${type} by title matching: "${postTitle}"`);
             continue;
           }
 
           streams.push(
             mapStream({
-              username,
-              password,
+              username: config.username,
+              password: config.password,
               fullResolution: file.fullres,
               fileExtension: getFileExtension(file),
               duration: getDuration(file),
               size: getSize(file),
-              title,
+              postTitle,
+              type,
               url: createStreamUrl(
                 { downURL: res.downURL, dlFarm: res.dlFarm, dlPort: res.dlPort },
-                username,
-                password,
+                config.username,
+                config.password,
                 createStreamPath(file),
-                baseUrl
+                config.baseUrl
               ),
               videoSize: file.rawSize,
               file,
@@ -574,7 +685,7 @@ builder.defineStreamHandler(
       }
 
       // Sort streams based on user preference
-      if (sortingPreference === 'language_first' && preferredLang) {
+      if (config.sortingPreference === 'language_first' && preferredLang) {
         logger.debug(`Applying language-first sorting for language: ${preferredLang}`);
 
         // Special handling for language-first sorting
@@ -599,74 +710,6 @@ builder.defineStreamHandler(
           `Found ${preferredLangStreams.length} streams with preferred language and ${otherStreams.length} other streams`
         );
 
-        // Sort each group by quality and size
-        const sortByQualityAndSize = (a: Stream, b: Stream) => {
-          // Extract quality info
-          const aDesc = a.description?.split('\n') || [];
-          const bDesc = b.description?.split('\n') || [];
-          const aQuality = a.name?.includes('\n') ? a.name.split('\n')[1] : '';
-          const bQuality = b.name?.includes('\n') ? b.name.split('\n')[1] : '';
-
-          // Get quality scores with improved 4K detection
-          const getQualityScore = (quality: string): number => {
-            if (!quality) return 0;
-
-            // Standardize the quality string for comparison
-            const q = quality.toUpperCase();
-
-            // Check for 4K indicators (multiple ways to indicate 4K)
-            if (
-              q.includes('4K') ||
-              q.includes('2160P') ||
-              q.includes('UHD') ||
-              q.includes('2160') ||
-              q.includes('ULTRA HD')
-            )
-              return 4;
-
-            // Check for 1080p
-            if (q.includes('1080P') || q.includes('1080')) return 3;
-
-            // Check for 720p
-            if (q.includes('720P') || q.includes('720')) return 2;
-
-            // Check for 480p/SD
-            if (q.includes('480P') || q.includes('480') || q.includes('SD')) return 1;
-
-            return 0;
-          };
-          const aScore = getQualityScore(aQuality);
-          const bScore = getQualityScore(bQuality);
-
-          // Compare quality scores
-          if (aScore !== bScore) {
-            return bScore - aScore;
-          }
-
-          // Compare sizes
-          const aSize = aDesc.length > 2 ? aDesc[2] : '';
-          const bSize = bDesc.length > 2 ? bDesc[2] : '';
-
-          if (aSize.includes('GB') && bSize.includes('GB')) {
-            const aGB = parseFloat(aSize.match(/[\d.]+/)?.[0] || '0');
-            const bGB = parseFloat(bSize.match(/[\d.]+/)?.[0] || '0');
-            if (aGB > bGB) return -1;
-            if (aGB < bGB) return 1;
-          }
-
-          if (aSize.includes('GB') && bSize.includes('MB')) return -1;
-          if (aSize.includes('MB') && bSize.includes('GB')) return 1;
-
-          if (aSize.includes('MB') && bSize.includes('MB')) {
-            const aMB = parseFloat(aSize.match(/[\d.]+/)?.[0] || '0');
-            const bMB = parseFloat(bSize.match(/[\d.]+/)?.[0] || '0');
-            if (aMB > bMB) return -1;
-            if (aMB < bMB) return 1;
-          }
-
-          return 0;
-        };
-
         // Sort each group independently
         preferredLangStreams.sort(sortByQualityAndSize);
         otherStreams.sort(sortByQualityAndSize);
@@ -683,77 +726,19 @@ builder.defineStreamHandler(
           const aHasPreferredLang = preferredLang && aFile?.alangs?.includes(preferredLang);
           const bHasPreferredLang = preferredLang && bFile?.alangs?.includes(preferredLang);
 
-          // Extract quality info
-          const aDesc = a.description?.split('\n') || [];
-          const bDesc = b.description?.split('\n') || [];
-          const aQuality = a.name?.includes('\n') ? a.name.split('\n')[1] : '';
-          const bQuality = b.name?.includes('\n') ? b.name.split('\n')[1] : '';
+          // Extract resolution info
+          const aResolution = getResolution(aFile);
+          const bResolution = getResolution(bFile);
 
-          // Get quality scores with improved 4K detection
-          const getQualityScore = (quality: string): number => {
-            if (!quality) return 0;
-
-            // Standardize the quality string for comparison
-            const q = quality.toUpperCase();
-
-            // Check for 4K indicators (multiple ways to indicate 4K)
-            if (
-              q.includes('4K') ||
-              q.includes('2160P') ||
-              q.includes('UHD') ||
-              q.includes('2160') ||
-              q.includes('ULTRA HD')
-            )
-              return 4;
-
-            // Check for 1080p
-            if (q.includes('1080P') || q.includes('1080')) return 3;
-
-            // Check for 720p
-            if (q.includes('720P') || q.includes('720')) return 2;
-
-            // Check for 480p/SD
-            if (q.includes('480P') || q.includes('480') || q.includes('SD')) return 1;
-
-            return 0;
-          };
-          const aScore = getQualityScore(aQuality);
-          const bScore = getQualityScore(bQuality);
-
-          // Size comparison logic
-          const compareSize = () => {
-            const aSize = aDesc.length > 2 ? aDesc[2] : '';
-            const bSize = bDesc.length > 2 ? bDesc[2] : '';
-
-            // Extract only the size part (before any date information)
-            const aSizePart = aSize.split('📅')[0].trim();
-            const bSizePart = bSize.split('📅')[0].trim();
-
-            if (aSizePart.includes('GB') && bSizePart.includes('GB')) {
-              const aGB = parseFloat(aSizePart.match(/[\d.]+/)?.[0] || '0');
-              const bGB = parseFloat(bSizePart.match(/[\d.]+/)?.[0] || '0');
-              if (aGB > bGB) return -1;
-              if (aGB < bGB) return 1;
-            }
-
-            if (aSizePart.includes('GB') && bSizePart.includes('MB')) return -1;
-            if (aSizePart.includes('MB') && bSizePart.includes('GB')) return 1;
-
-            if (aSizePart.includes('MB') && bSizePart.includes('MB')) {
-              const aMB = parseFloat(aSizePart.match(/[\d.]+/)?.[0] || '0');
-              const bMB = parseFloat(bSizePart.match(/[\d.]+/)?.[0] || '0');
-              if (aMB > bMB) return -1;
-              if (aMB < bMB) return 1;
-            }
-
-            return 0;
-          };
+          // Extract quality scores
+          const aScore = getQualityScore(aResolution);
+          const bScore = getQualityScore(bResolution);
 
           // Apply sorting based on user preference
-          switch (sortingPreference) {
+          switch (config.sortingPreference) {
             case 'size_first':
               // Size first, then quality, then language
-              const sizeCompare = compareSize();
+              const sizeCompare = compareSize(aFile, bFile);
               if (sizeCompare !== 0) {
                 return sizeCompare;
               }
@@ -782,7 +767,7 @@ builder.defineStreamHandler(
                 return aHasPreferredLang ? -1 : 1;
               }
               // Then size
-              return compareSize();
+              return compareSize(aFile, bFile);
 
             case 'lang_first':
             case 'language_first':
@@ -793,7 +778,7 @@ builder.defineStreamHandler(
               if (aScore !== bScore) {
                 return bScore - aScore;
               }
-              return compareSize();
+              return compareSize(aFile, bFile);
 
             case 'quality_first':
             default:
@@ -808,7 +793,7 @@ builder.defineStreamHandler(
                 return aHasPreferredLang ? -1 : 1;
               }
               // Then size
-              return compareSize();
+              return compareSize(aFile, bFile);
           }
         });
       }
@@ -952,7 +937,7 @@ builder.defineStreamHandler(
       }
 
       // Now sort the filtered streams based on user preference
-      if (sortingPreference === 'language_first' && preferredLang) {
+      if (config.sortingPreference === 'language_first' && preferredLang) {
         logger.debug(`Applying language-first sorting for language: ${preferredLang}`);
 
         // Special handling for language-first sorting
@@ -977,74 +962,6 @@ builder.defineStreamHandler(
           `Sorting: ${preferredLangStreams.length} streams with preferred language and ${otherStreams.length} other streams`
         );
 
-        // Sort each group by quality and size
-        const sortByQualityAndSize = (a: Stream, b: Stream) => {
-          // Extract quality info
-          const aDesc = a.description?.split('\n') || [];
-          const bDesc = b.description?.split('\n') || [];
-          const aQuality = a.name?.includes('\n') ? a.name.split('\n')[1] : '';
-          const bQuality = b.name?.includes('\n') ? b.name.split('\n')[1] : '';
-
-          // Get quality scores with improved 4K detection
-          const getQualityScore = (quality: string): number => {
-            if (!quality) return 0;
-
-            // Standardize the quality string for comparison
-            const q = quality.toUpperCase();
-
-            // Check for 4K indicators (multiple ways to indicate 4K)
-            if (
-              q.includes('4K') ||
-              q.includes('2160P') ||
-              q.includes('UHD') ||
-              q.includes('2160') ||
-              q.includes('ULTRA HD')
-            )
-              return 4;
-
-            // Check for 1080p
-            if (q.includes('1080P') || q.includes('1080')) return 3;
-
-            // Check for 720p
-            if (q.includes('720P') || q.includes('720')) return 2;
-
-            // Check for 480p/SD
-            if (q.includes('480P') || q.includes('480') || q.includes('SD')) return 1;
-
-            return 0;
-          };
-          const aScore = getQualityScore(aQuality);
-          const bScore = getQualityScore(bQuality);
-
-          // Compare quality scores
-          if (aScore !== bScore) {
-            return bScore - aScore;
-          }
-
-          // Compare sizes
-          const aSize = aDesc.length > 2 ? aDesc[2] : '';
-          const bSize = bDesc.length > 2 ? bDesc[2] : '';
-
-          if (aSize.includes('GB') && bSize.includes('GB')) {
-            const aGB = parseFloat(aSize.match(/[\d.]+/)?.[0] || '0');
-            const bGB = parseFloat(bSize.match(/[\d.]+/)?.[0] || '0');
-            if (aGB > bGB) return -1;
-            if (aGB < bGB) return 1;
-          }
-
-          if (aSize.includes('GB') && bSize.includes('MB')) return -1;
-          if (aSize.includes('MB') && bSize.includes('GB')) return 1;
-
-          if (aSize.includes('MB') && bSize.includes('MB')) {
-            const aMB = parseFloat(aSize.match(/[\d.]+/)?.[0] || '0');
-            const bMB = parseFloat(bSize.match(/[\d.]+/)?.[0] || '0');
-            if (aMB > bMB) return -1;
-            if (aMB < bMB) return 1;
-          }
-
-          return 0;
-        };
-
         // Sort each group independently
         preferredLangStreams.sort(sortByQualityAndSize);
         otherStreams.sort(sortByQualityAndSize);
@@ -1061,73 +978,19 @@ builder.defineStreamHandler(
           const aHasPreferredLang = preferredLang && aFile?.alangs?.includes(preferredLang);
           const bHasPreferredLang = preferredLang && bFile?.alangs?.includes(preferredLang);
 
-          // Extract quality info
-          const aDesc = a.description?.split('\n') || [];
-          const bDesc = b.description?.split('\n') || [];
-          const aQuality = a.name?.includes('\n') ? a.name.split('\n')[1] : '';
-          const bQuality = b.name?.includes('\n') ? b.name.split('\n')[1] : '';
+          // Extract resolution info
+          const aResolution = getResolution(aFile);
+          const bResolution = getResolution(bFile);
 
-          // Get quality scores with improved 4K detection
-          const getQualityScore = (quality: string): number => {
-            if (!quality) return 0;
-
-            // Standardize the quality string for comparison
-            const q = quality.toUpperCase();
-
-            // Check for 4K indicators (multiple ways to indicate 4K)
-            if (
-              q.includes('4K') ||
-              q.includes('2160P') ||
-              q.includes('UHD') ||
-              q.includes('2160') ||
-              q.includes('ULTRA HD')
-            )
-              return 4;
-
-            // Check for 1080p
-            if (q.includes('1080P') || q.includes('1080')) return 3;
-
-            // Check for 720p
-            if (q.includes('720P') || q.includes('720')) return 2;
-
-            // Check for 480p/SD
-            if (q.includes('480P') || q.includes('480') || q.includes('SD')) return 1;
-
-            return 0;
-          };
-          const aScore = getQualityScore(aQuality);
-          const bScore = getQualityScore(bQuality);
-
-          // Size comparison logic
-          const compareSize = () => {
-            const aSize = aDesc.length > 2 ? aDesc[2] : '';
-            const bSize = bDesc.length > 2 ? bDesc[2] : '';
-
-            if (aSize.includes('GB') && bSize.includes('GB')) {
-              const aGB = parseFloat(aSize.match(/[\d.]+/)?.[0] || '0');
-              const bGB = parseFloat(bSize.match(/[\d.]+/)?.[0] || '0');
-              if (aGB > bGB) return -1;
-              if (aGB < bGB) return 1;
-            }
-
-            if (aSize.includes('GB') && bSize.includes('MB')) return -1;
-            if (aSize.includes('MB') && bSize.includes('GB')) return 1;
-
-            if (aSize.includes('MB') && bSize.includes('MB')) {
-              const aMB = parseFloat(aSize.match(/[\d.]+/)?.[0] || '0');
-              const bMB = parseFloat(bSize.match(/[\d.]+/)?.[0] || '0');
-              if (aMB > bMB) return -1;
-              if (aMB < bMB) return 1;
-            }
-
-            return 0;
-          };
+          // Extract quality scores
+          const aScore = getQualityScore(aResolution);
+          const bScore = getQualityScore(bResolution);
 
           // Apply sorting based on user preference
-          switch (sortingPreference) {
+          switch (config.sortingPreference) {
             case 'size_first':
               // Size first, then quality, then language
-              const sizeCompare = compareSize();
+              const sizeCompare = compareSize(aFile, bFile);
               if (sizeCompare !== 0) {
                 return sizeCompare;
               }
@@ -1156,7 +1019,7 @@ builder.defineStreamHandler(
                 return aHasPreferredLang ? -1 : 1;
               }
               // Then size
-              return compareSize();
+              return compareSize(aFile, bFile);
 
             case 'lang_first':
             case 'language_first':
@@ -1167,7 +1030,7 @@ builder.defineStreamHandler(
               if (aScore !== bScore) {
                 return bScore - aScore;
               }
-              return compareSize();
+              return compareSize(aFile, bFile);
 
             case 'quality_first':
             default:
@@ -1182,7 +1045,7 @@ builder.defineStreamHandler(
                 return aHasPreferredLang ? -1 : 1;
               }
               // Then size
-              return compareSize();
+              return compareSize(aFile, bFile);
           }
         });
       }
@@ -1202,7 +1065,7 @@ builder.defineStreamHandler(
       } else {
         logger.info(`Found 0 streams total for ${id}`);
       }
-
+      console.timeEnd('Processing search results');
       // Cache the result
       setCache(cacheKey, { streams, ...getCacheOptions(streams.length) });
 
@@ -1228,14 +1091,16 @@ function mapStream({
   duration,
   size,
   fullResolution,
-  title,
+  postTitle,
+  type,
   fileExtension,
   videoSize,
   url,
   file,
   preferredLang,
 }: {
-  title: string;
+  postTitle: string;
+  type: string;
   url: string;
   username: string;
   password: string;
@@ -1244,40 +1109,52 @@ function mapStream({
   duration: string | undefined;
   size: string | undefined;
   fullResolution: string | undefined;
-  file: any;
+  file: FileData;
   preferredLang: string;
 }): Stream {
-  logger.debug(`Mapping stream: "${title}" (${fileExtension}, ${size}, ${duration})`);
+  logger.debug(`Mapping stream: "${postTitle}" (${fileExtension}, ${size}, ${duration})`);
 
-  const quality = getQuality(title, fullResolution);
+  const parsedFilename = filenameParse(postTitle, type === 'series' ? true : false);
+  const audioCodec = parsedFilename.audioCodec;
+  const videoCodec = parsedFilename.videoCodec;
+  const resolution = parsedFilename.resolution;
+
+  const quality = getVideoQuality(postTitle, fullResolution);
+  const audioQuality = getAudioQuality(file);
 
   // Log language information for debugging
   if (file.alangs && file.alangs.length > 0) {
-    logger.debug(`Stream "${title}" has languages: ${JSON.stringify(file.alangs)}`);
+    logger.debug(`Stream "${postTitle}" has languages: ${JSON.stringify(file.alangs)}`);
   } else {
-    logger.debug(`Stream "${title}" has no language information`);
+    logger.debug(`Stream "${postTitle}" has no language information`);
   }
 
   // Calculate days since upload
   const publishDate = getPublishDate(file.ts);
 
+  // calculate bitrate
+  const bitrate = calculateBitrate(file);
+  const internetSpeedStr = bitrate ? getRecommendedInternetSpeed(bitrate) : '';
+
   // Show language information in the description if available
   const languageInfo = file.alangs?.length
-    ? `🌐 ${file.alangs.join(', ')}${preferredLang && file.alangs.includes(preferredLang) ? ' ⭐' : ''}`
+    ? `🌐 ${file.alangs.map((lang: string) => (lang === preferredLang ? `⭐ ${lang}` : `${lang}`)).join(' | ')}`
     : '🌐 Unknown';
 
-  const stream: Stream & { _temp?: any } = {
-    name: `Easynews++${quality ? `\n${quality}` : ''}`,
+  const stream: Stream & { _temp?: { file: FileData } } = {
+    name: `Easynews++`,
     description: [
-      `${title}${fileExtension}`,
+      // `🎬 ${parsedFilename.title} ${parsedFilename.year}`,
+      `📺 ${quality} • 🎧 ${parsedFilename.audioCodec ? parsedFilename.audioCodec : audioQuality} • 🎞️ ${fileExtension}`,
+      `📦 ${size ?? 'unknown size'} • ${internetSpeedStr} • ${publishDate}`,
       `🕛 ${duration ?? 'unknown duration'}`,
-      `📦 ${size ?? 'unknown size'} ${publishDate}`,
       languageInfo,
+      `👥 ${parsedFilename.group ? ` ${parsedFilename.group}` : 'unknown'}`,
     ].join('\n'),
     url: url,
     behaviorHints: {
       notWebReady: true,
-      filename: `${title}${fileExtension}`,
+      filename: `${postTitle}${fileExtension}`,
     },
     // Add temporary property with file data for sorting
     _temp: { file },

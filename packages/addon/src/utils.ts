@@ -1,7 +1,8 @@
-import { EasynewsSearchResponse, FileData } from 'easynews-plus-plus-api';
+import { EasynewsSearchResponse, FileData, CodingFormat } from 'easynews-plus-plus-api';
 import { MetaProviderResponse } from './meta';
 import { ContentType } from 'stremio-addon-sdk';
 import { parse as parseTorrentTitle } from 'parse-torrent-title';
+
 import path from 'path';
 import dotenv from 'dotenv';
 import { createLogger } from 'easynews-plus-plus-shared';
@@ -9,6 +10,7 @@ import { Buffer } from 'buffer';
 
 // Import the custom titles JSON directly
 import customTitlesJson from '../../../custom-titles.json';
+import { title } from 'process';
 
 // Load .env file to ensure we have all environment variables
 function loadEnv() {
@@ -384,12 +386,83 @@ export function getSize(file: FileData) {
   return file['4'] ?? '';
 }
 
+export function getAudioFormat(file: FileData): CodingFormat | undefined {
+  return file['18'] ?? '';
+}
+
+export function getDurationInSeconds(file: FileData): number | undefined {
+  const durationStr = getDuration(file);
+  const regex = /(?:(\d+)h)?(?::)?(?:(\d+)m)?(?::)?(\d+)s?/;
+  const match = durationStr.match(regex);
+  if (!match) return undefined;
+
+  const hours = parseInt(match[1] || '0', 10);
+  const minutes = parseInt(match[2] || '0', 10);
+  const seconds = parseInt(match[3] || '0', 10);
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+export function calculateBitrate(file: FileData): number | undefined {
+  const durationSeconds = getDurationInSeconds(file);
+  if (durationSeconds === undefined || durationSeconds === 0) return undefined;
+
+  const bits = file.rawSize * 8;
+  const bitrate = bits / 1_000_000 / durationSeconds;
+  return bitrate;
+}
+
+export function getRecommendedInternetSpeed(bitrate: number): string {
+  let emoji: string;
+  let recommendation: string;
+
+  if (bitrate < 3) {
+    emoji = '🐢';
+    recommendation = 'at least 3 Mbit/s';
+  } else if (bitrate < 5) {
+    emoji = '🚶';
+    recommendation = 'at least 5 Mbit/s';
+  } else if (bitrate < 10) {
+    emoji = '🚴';
+    recommendation = 'at least 10 Mbit/s';
+  } else if (bitrate < 20) {
+    emoji = '🚗';
+    recommendation = 'at least 20 Mbit/s';
+  } else if (bitrate < 50) {
+    emoji = '🚀';
+    recommendation = 'at least 50 Mbit/s';
+  } else {
+    emoji = '🛰️';
+    recommendation = '100 Mbit/s or more';
+  }
+
+  return `${emoji} ${bitrate.toFixed(0)} Mbit/s`;
+}
+
+type HDRType = '🌈 HDR10' | '🌈 HDR10+' | '🔆 Dolby Vision' | '🔆🌈 Hybrid' | '';
+
+function detectHDRType(releaseName: string): HDRType {
+  const lower = releaseName.toLowerCase();
+
+  const isDolbyVision = /dolby.?vision|dv/.test(lower);
+  const isHDR10Plus = /hdr10\+/.test(lower);
+  const isHDR10 = /hdr|hdr10/.test(lower);
+
+  if (isDolbyVision && isHDR10) return '🔆🌈 Hybrid'; // z. B. HDR10 + Dolby Vision
+  if (isDolbyVision) return '🔆 Dolby Vision';
+  if (isHDR10Plus) return '🌈 HDR10+';
+  if (isHDR10) return '🌈 HDR10';
+
+  return '';
+}
+
 /**
  * Extract video quality information from the title or fallback resolution
  */
-export function getQuality(title: string, fallbackResolution?: string): string | undefined {
+export function getVideoQuality(title: string, fallbackResolution?: string): string | undefined {
   logger.debug(`Getting quality for: "${title}", fallback: ${fallbackResolution}`);
   const { resolution } = parseTorrentTitle(title);
+  const hdrType = detectHDRType(title);
 
   // Try to find quality indicators in the title if resolution not found
   if (!resolution && title) {
@@ -421,10 +494,10 @@ export function getQuality(title: string, fallbackResolution?: string): string |
     // Map common resolution formats to standard quality names
     if (resolution === '2160p' || resolution.includes('4k') || resolution.includes('4K')) {
       logger.debug(`Quality found by parser: 4K`);
-      return '4K';
+      return `2160p ${hdrType ? `(${hdrType})` : ''}`;
     }
     logger.debug(`Quality found by parser: ${resolution}`);
-    return resolution;
+    return `${resolution} ${hdrType ? `(${hdrType})` : ''}`;
   }
 
   // Use fallback if provided
@@ -434,6 +507,32 @@ export function getQuality(title: string, fallbackResolution?: string): string |
   }
 
   logger.debug(`No quality found`);
+  return undefined;
+}
+
+/**
+ * Extract audio quality information from the title or fallback resolution
+ */
+export function getAudioQuality(file: FileData): string | undefined {
+  const title = getPostTitle(file);
+  logger.debug(`Getting audio quality for: "${title}"`);
+  const audioFormat = getAudioFormat(file);
+
+  const parsed = parseTorrentTitle(title);
+
+  if (audioFormat) {
+    logger.debug(`Quality found by Easynews: ${parsed.audio}`);
+
+    if (parsed.audio?.toLowerCase() === 'atmos') {
+      return `${audioFormat.toUpperCase()} (ATMOS)`;
+    }
+    return `${audioFormat.toUpperCase()} `;
+  } else if (parsed.audio) {
+    logger.debug(`Quality found by parser: ${parsed.audio}`);
+    return `${parsed.audio.toUpperCase()} `;
+  }
+
+  logger.debug(`No audio quality found`);
   return undefined;
 }
 

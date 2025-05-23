@@ -20,3 +20,10 @@ export type Stream = {
     filename?: string;
   };
 };
+
+export enum VideoQuality {
+  SD = 'SD',
+  HD = 'HD',
+  FULLHD = 'FULLHD',
+  UHD_4K = '4K',
+}

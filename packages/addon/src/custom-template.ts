@@ -72,7 +72,7 @@ function landingTemplate(manifest: Manifest): string {
         // Copy all existing options
         Object.entries(field.options).forEach(([key, value]) => {
           // Check if this is the "All Qualities" option and translate it
-          if (key === '4k,1080p,720p,480p' && translations.qualityOptions.allQualities) {
+          if (key === '2160p,1080p,720p,480p' && translations.qualityOptions.allQualities) {
             translatedOptions[key] = translations.qualityOptions.allQualities;
           } else {
             // Keep other options as is

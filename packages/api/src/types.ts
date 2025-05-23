@@ -56,6 +56,8 @@ export type FileData = {
   type: ContentType;
   height: string;
   width: string;
+  xres: number;
+  yres: number;
   theight: number;
   twidth: number;
   fullres: string;
@@ -86,12 +88,27 @@ export enum FileExtension {
 export enum CompressionStandard {
   H264 = 'H264',
   Xvid = 'XVID',
+  HVEC = 'HEVC',
+}
+
+export enum VideoQuality {
+  SD = 'SD',
+  HD = 'HD',
+  FULLHD = 'FULLHD',
+  UHD_4K = '4K',
 }
 
 export enum CodingFormat {
   AAC = 'AAC',
   Mp3 = 'MP3',
   Mpg123 = 'MPG123',
+  Eac3 = 'EAC3',
+  TrueHD = 'TrueHD',
+  AC3 = 'AC3',
+  Flac = 'FLAC',
+  Dts = 'DTS',
+  DtsHd = 'DTS-HD',
+  DtsX = 'DTS-X',
   Unknown = 'UNKNOWN',
 }
 
